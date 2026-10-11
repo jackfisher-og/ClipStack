@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import struct
 import sys
 import threading
@@ -62,16 +63,42 @@ THEMES = {
 }
 
 
-def theme_settings_path():
+def user_data_directory():
     if sys.platform == "win32":
-        app_data = Path(
+        return Path(
             os.environ.get(
                 "LOCALAPPDATA",
                 Path.home() / "AppData" / "Local",
             )
-        )
-        return app_data / "ClipStack" / "settings.json"
-    return Path.home() / ".config" / "ClipStack" / "settings.json"
+        ) / "ClipStack"
+    return Path.home() / ".config" / "ClipStack"
+
+
+def theme_settings_path():
+    return user_data_directory() / "settings.json"
+
+
+def clipboard_history_path():
+    data_directory = user_data_directory()
+    try:
+        data_directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise OSError(
+            f"Could not create ClipStack user data directory: {data_directory}"
+        ) from error
+
+    history_path = data_directory / "clipboard_history.json"
+    legacy_history_path = Path(__file__).resolve().with_name("clipboard_history.json")
+    if not history_path.exists() and legacy_history_path.is_file():
+        try:
+            shutil.copy2(legacy_history_path, history_path)
+        except OSError as error:
+            warnings.warn(
+                f"Could not migrate clipboard history from "
+                f"{legacy_history_path} to {history_path}: {error}",
+                RuntimeWarning,
+            )
+    return history_path
 
 
 def load_theme():
@@ -1144,7 +1171,7 @@ def main():
 
     card_font = tkfont.Font(family=APP_FONT_FAMILY, size=-11)
     timestamp_font = tkfont.Font(family=APP_FONT_FAMILY, size=-8)
-    history_path = Path(__file__).resolve().with_name("clipboard_history.json")
+    history_path = clipboard_history_path()
     history = load_history(history_path, window)
     clear_history_dialog = None
     clear_history_dialog_image = None
