@@ -19,10 +19,12 @@ from PIL import (
     ImageDraw,
     ImageEnhance,
     ImageFilter,
-    ImageFont,
     ImageGrab,
     ImageTk,
 )
+
+myappid = "clipstack.app.1.0"
+ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
 
 BACKGROUND = "#1e1e1e"
@@ -1773,15 +1775,10 @@ def main():
     def schedule_exit_application(_icon=None, _item=None):
         window.after(0, exit_application)
 
-    tray_image = Image.new("RGBA", (64, 64), "#1e1e1e")
-    tray_draw = ImageDraw.Draw(tray_image)
-    tray_draw.rounded_rectangle((6, 6, 58, 58), radius=12, fill="#4caf50")
-    tray_draw.text(
-        (17, 11),
-        "C",
-        fill="#ffffff",
-        font=ImageFont.truetype(str(font_path), 36),
-    )
+    with Image.open(icon_path) as icon_source:
+        icon_source.load()
+        tray_image = icon_source.convert("RGBA")
+        tray_image.thumbnail((64, 64), Image.Resampling.LANCZOS)
     tray_icon = pystray.Icon(
         "ClipStack",
         tray_image,
