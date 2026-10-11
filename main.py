@@ -1,0 +1,1007 @@
+import base64
+import ctypes
+from datetime import datetime
+from io import BytesIO
+import json
+from pathlib import Path
+import struct
+import sys
+import tkinter as tk
+import tkinter.font as tkfont
+import warnings
+import zlib
+from PIL import Image, ImageTk
+
+
+BACKGROUND = "#1e1e1e"
+PANEL = "#2b2b2b"
+CARD = "#383838"
+CARD_SIZE = 120
+CARD_GAP = 12
+HOVER_LIFT = 6
+MAX_HISTORY = 50
+MAX_TEXT_LINES = 4
+
+
+def load_history(history_path, master):
+    if not history_path.exists():
+        history_path.write_text(
+            json.dumps({"version": 1, "items": []}, indent=2),
+            encoding="utf-8",
+        )
+        return []
+
+    try:
+        stored_history = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        warnings.warn(f"Could not read clipboard history: {error}", RuntimeWarning)
+        return []
+
+    if not isinstance(stored_history, dict) or not isinstance(
+        stored_history.get("items"), list
+    ):
+        warnings.warn("Clipboard history file has an invalid structure.", RuntimeWarning)
+        return []
+
+    history = []
+    for item in stored_history["items"]:
+        try:
+            item_type = item["type"]
+            copied_at = datetime.fromisoformat(item["timestamp"])
+            if item_type == "text":
+                content = item["content"]
+                if not isinstance(content, str):
+                    raise ValueError("Text content must be a string.")
+                history.append(("text", content, copied_at, None, None))
+            elif item_type == "image":
+                image_format = item["format"]
+                image_data = base64.b64decode(item["content"], validate=True)
+                thumbnail = open_clipboard_image(image_format, image_data, master)
+                history.append(
+                    ("image", image_data, copied_at, thumbnail, image_format)
+                )
+            else:
+                raise ValueError(f"Unsupported clipboard item type: {item_type!r}.")
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            OSError,
+            tk.TclError,
+            Image.DecompressionBombError,
+        ) as error:
+            warnings.warn(f"Skipping invalid clipboard history item: {error}", RuntimeWarning)
+
+    history.sort(key=lambda entry: entry[2], reverse=True)
+    return history[:MAX_HISTORY]
+
+
+def save_history(history_path, history):
+    items = []
+    for item_type, content, copied_at, _thumbnail, image_format in history:
+        if item_type == "image":
+            content = base64.b64encode(content).decode("ascii")
+        items.append(
+            {
+                "type": item_type,
+                "content": content,
+                "timestamp": copied_at.isoformat(),
+                **({"format": image_format} if item_type == "image" else {}),
+            }
+        )
+
+    temporary_path = history_path.with_suffix(history_path.suffix + ".tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps({"version": 1, "items": items}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(history_path)
+    except OSError as error:
+        warnings.warn(f"Could not save clipboard history: {error}", RuntimeWarning)
+
+
+def dib_to_rgb(data):
+    if len(data) < 40:
+        return None
+
+    (
+        header_size,
+        width,
+        signed_height,
+        planes,
+        bits_per_pixel,
+        compression,
+        image_size,
+        _horizontal_resolution,
+        _vertical_resolution,
+        _colors_used,
+        _important_colors,
+    ) = struct.unpack_from("<IiiHHIIiiII", data)
+    height = abs(signed_height)
+    if (
+        header_size < 40
+        or width <= 0
+        or height <= 0
+        or planes != 1
+        or bits_per_pixel not in (24, 32)
+        or compression not in (0, 3, 6)
+    ):
+        return None
+
+    pixel_offset = header_size
+    red_mask = green_mask = blue_mask = None
+    if compression in (3, 6):
+        if header_size >= 52:
+            red_mask, green_mask, blue_mask = struct.unpack_from("<III", data, 40)
+        else:
+            mask_count = 4 if compression == 6 else 3
+            mask_bytes = mask_count * 4
+            if len(data) < pixel_offset + mask_bytes:
+                return None
+            red_mask, green_mask, blue_mask = struct.unpack_from(
+                "<III", data, pixel_offset
+            )
+            pixel_offset += mask_bytes
+
+    row_stride = ((width * bits_per_pixel + 31) // 32) * 4
+    if len(data) < pixel_offset + row_stride * height:
+        return None
+
+    scale = min(1, 92 / width, 66 / height)
+    output_width = max(1, round(width * scale))
+    output_height = max(1, round(height * scale))
+    pixels = bytearray()
+
+    def extract_channel(pixel, mask):
+        if not mask:
+            return 0
+        shift = (mask & -mask).bit_length() - 1
+        value = (pixel & mask) >> shift
+        maximum = mask >> shift
+        return (value * 255 + maximum // 2) // maximum
+
+    for output_y in range(output_height):
+        source_y = min(height - 1, output_y * height // output_height)
+        row_y = source_y if signed_height < 0 else height - 1 - source_y
+        row_offset = pixel_offset + row_y * row_stride
+        for output_x in range(output_width):
+            source_x = min(width - 1, output_x * width // output_width)
+            pixel_offset_x = row_offset + source_x * (bits_per_pixel // 8)
+            if bits_per_pixel == 24:
+                blue, green, red = data[pixel_offset_x : pixel_offset_x + 3]
+            elif compression in (3, 6):
+                pixel = int.from_bytes(data[pixel_offset_x : pixel_offset_x + 4], "little")
+                red = extract_channel(pixel, red_mask)
+                green = extract_channel(pixel, green_mask)
+                blue = extract_channel(pixel, blue_mask)
+            else:
+                blue, green, red = data[pixel_offset_x : pixel_offset_x + 3]
+            pixels.extend((red, green, blue))
+
+    return output_width, output_height, bytes(pixels)
+
+
+def png_to_rgb(data):
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+
+    width = height = bit_depth = color_type = interlace = None
+    compressed = bytearray()
+    palette = None
+    transparency = b""
+    offset = 8
+    while offset + 12 <= len(data):
+        chunk_length = struct.unpack_from(">I", data, offset)[0]
+        chunk_type = data[offset + 4 : offset + 8]
+        chunk_start = offset + 8
+        chunk_end = chunk_start + chunk_length
+        if chunk_end + 4 > len(data):
+            return None
+        chunk_data = data[chunk_start:chunk_end]
+        if chunk_type == b"IHDR":
+            if len(chunk_data) != 13:
+                return None
+            width, height, bit_depth, color_type, compression, filtering, interlace = (
+                struct.unpack(">IIBBBBB", chunk_data)
+            )
+            if compression != 0 or filtering != 0 or interlace != 0:
+                return None
+        elif chunk_type == b"IDAT":
+            compressed.extend(chunk_data)
+        elif chunk_type == b"PLTE":
+            palette = chunk_data
+        elif chunk_type == b"tRNS":
+            transparency = chunk_data
+        elif chunk_type == b"IEND":
+            break
+        offset = chunk_end + 4
+
+    channels_by_type = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+    if (
+        not width
+        or not height
+        or width * height > 50_000_000
+        or bit_depth != 8
+        or color_type not in channels_by_type
+    ):
+        return None
+    channels = channels_by_type[color_type]
+    if color_type == 3 and (not palette or len(palette) % 3):
+        return None
+
+    try:
+        raw = zlib.decompress(compressed)
+    except zlib.error:
+        return None
+
+    row_bytes = width * channels
+    if len(raw) != (row_bytes + 1) * height:
+        return None
+
+    scale = min(1, 92 / width, 66 / height)
+    output_width = max(1, round(width * scale))
+    output_height = max(1, round(height * scale))
+    output = bytearray()
+    previous = bytearray(row_bytes)
+    source_offset = 0
+    output_y = 0
+
+    def paeth_predictor(left, above, upper_left):
+        estimate = left + above - upper_left
+        distances = (
+            abs(estimate - left),
+            abs(estimate - above),
+            abs(estimate - upper_left),
+        )
+        return (left, above, upper_left)[distances.index(min(distances))]
+
+    for source_y in range(height):
+        filter_type = raw[source_offset]
+        source_offset += 1
+        row = bytearray(raw[source_offset : source_offset + row_bytes])
+        source_offset += row_bytes
+        if filter_type > 4:
+            return None
+        for index in range(row_bytes):
+            left = row[index - channels] if index >= channels else 0
+            above = previous[index]
+            upper_left = previous[index - channels] if index >= channels else 0
+            if filter_type == 1:
+                predictor = left
+            elif filter_type == 2:
+                predictor = above
+            elif filter_type == 3:
+                predictor = (left + above) // 2
+            elif filter_type == 4:
+                predictor = paeth_predictor(left, above, upper_left)
+            else:
+                predictor = 0
+            row[index] = (row[index] + predictor) & 0xFF
+
+        if source_y == output_y * height // output_height:
+            for output_x in range(output_width):
+                source_x = output_x * width // output_width
+                pixel_offset = source_x * channels
+                if color_type == 0:
+                    red = green = blue = row[pixel_offset]
+                    alpha = 255
+                elif color_type == 2:
+                    red, green, blue = row[pixel_offset : pixel_offset + 3]
+                    alpha = 255
+                elif color_type == 3:
+                    palette_index = row[pixel_offset]
+                    palette_offset = palette_index * 3
+                    if palette_offset + 3 > len(palette):
+                        return None
+                    red, green, blue = palette[palette_offset : palette_offset + 3]
+                    alpha = (
+                        transparency[palette_index]
+                        if palette_index < len(transparency)
+                        else 255
+                    )
+                elif color_type == 4:
+                    red = green = blue = row[pixel_offset]
+                    alpha = row[pixel_offset + 1]
+                else:
+                    red, green, blue, alpha = row[pixel_offset : pixel_offset + 4]
+                if alpha != 255:
+                    red = (red * alpha + 56 * (255 - alpha)) // 255
+                    green = (green * alpha + 56 * (255 - alpha)) // 255
+                    blue = (blue * alpha + 56 * (255 - alpha)) // 255
+                output.extend((red, green, blue))
+            output_y += 1
+        previous = row
+
+    if output_y != output_height:
+        return None
+    return output_width, output_height, bytes(output)
+
+
+def read_windows_clipboard_image(window):
+    if sys.platform != "win32":
+        return False, None
+
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    open_clipboard = user32.OpenClipboard
+    open_clipboard.argtypes = (wintypes.HWND,)
+    open_clipboard.restype = wintypes.BOOL
+    if not open_clipboard(window.winfo_id()):
+        return False, None
+
+    try:
+        register_format = user32.RegisterClipboardFormatW
+        register_format.argtypes = (wintypes.LPCWSTR,)
+        register_format.restype = wintypes.UINT
+        formats = (
+            (register_format("PNG"), "png"),
+            (17, "dib"),
+            (8, "dib"),
+        )
+
+        is_available = user32.IsClipboardFormatAvailable
+        is_available.argtypes = (wintypes.UINT,)
+        is_available.restype = wintypes.BOOL
+        get_data = user32.GetClipboardData
+        get_data.argtypes = (wintypes.UINT,)
+        get_data.restype = wintypes.HANDLE
+        global_size = kernel32.GlobalSize
+        global_size.argtypes = (wintypes.HGLOBAL,)
+        global_size.restype = ctypes.c_size_t
+        global_lock = kernel32.GlobalLock
+        global_lock.argtypes = (wintypes.HGLOBAL,)
+        global_lock.restype = ctypes.c_void_p
+        global_unlock = kernel32.GlobalUnlock
+        global_unlock.argtypes = (wintypes.HGLOBAL,)
+        global_unlock.restype = wintypes.BOOL
+
+        image_data = []
+        for clipboard_format, image_format in formats:
+            if not clipboard_format or not is_available(clipboard_format):
+                continue
+            handle = get_data(clipboard_format)
+            if not handle:
+                continue
+            size = global_size(handle)
+            pointer = global_lock(handle)
+            if not pointer:
+                continue
+            try:
+                data = ctypes.string_at(pointer, size)
+            finally:
+                global_unlock(handle)
+
+            if data:
+                image_data.append((image_format, data))
+        return True, image_data
+    finally:
+        user32.CloseClipboard()
+
+
+def open_clipboard_image(image_format, data, master):
+    if image_format == "dib":
+        if len(data) < 40:
+            raise ValueError("Clipboard DIB header is incomplete.")
+
+        header_size, = struct.unpack_from("<I", data)
+        if header_size < 40 or header_size > len(data):
+            raise ValueError("Clipboard DIB header is invalid.")
+        bits_per_pixel = struct.unpack_from("<H", data, 14)[0]
+        compression = struct.unpack_from("<I", data, 16)[0]
+        colors_used = struct.unpack_from("<I", data, 32)[0]
+        pixel_offset = header_size
+        if header_size == 40 and compression in (3, 6):
+            pixel_offset += 16 if compression == 6 else 12
+        if bits_per_pixel <= 8:
+            pixel_offset += (colors_used or (1 << bits_per_pixel)) * 4
+        bmp_header = b"BM" + struct.pack(
+            "<IHHI",
+            len(data) + 14,
+            0,
+            0,
+            pixel_offset + 14,
+        )
+        data = bmp_header + data
+
+    with Image.open(BytesIO(data)) as image:
+        image.load()
+        image.thumbnail((92, 66), Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(image.convert("RGBA"), master=master)
+
+
+def draw_container(canvas, _event=None):
+    canvas.delete("container")
+    width = canvas.winfo_width()
+    height = canvas.winfo_height()
+    radius = 12
+
+    if width <= radius * 2 or height <= radius * 2:
+        return
+
+    color = PANEL
+    canvas.create_rectangle(
+        radius,
+        0,
+        width - radius,
+        height,
+        fill=color,
+        outline=color,
+        tags="container",
+    )
+    canvas.create_rectangle(
+        0,
+        radius,
+        width,
+        height - radius,
+        fill=color,
+        outline=color,
+        tags="container",
+    )
+
+    for x, y in (
+        (0, 0),
+        (width - radius * 2, 0),
+        (0, height - radius * 2),
+        (width - radius * 2, height - radius * 2),
+    ):
+        canvas.create_oval(
+            x,
+            y,
+            x + radius * 2,
+            y + radius * 2,
+            fill=color,
+            outline=color,
+            tags="container",
+        )
+
+
+def draw_rounded_rectangle(canvas, x, y, width, height, radius, color, tags=None):
+    canvas.create_rectangle(
+        x + radius,
+        y,
+        x + width - radius,
+        y + height,
+        fill=color,
+        outline=color,
+        tags=tags,
+    )
+    canvas.create_rectangle(
+        x,
+        y + radius,
+        x + width,
+        y + height - radius,
+        fill=color,
+        outline=color,
+        tags=tags,
+    )
+    for corner_x, corner_y in (
+        (x, y),
+        (x + width - radius * 2, y),
+        (x, y + height - radius * 2),
+        (x + width - radius * 2, y + height - radius * 2),
+    ):
+        canvas.create_oval(
+            corner_x,
+            corner_y,
+            corner_x + radius * 2,
+            corner_y + radius * 2,
+            fill=color,
+            outline=color,
+            tags=tags,
+        )
+
+
+def fit_clipboard_text(text, font, width, max_lines):
+    words = " ".join(text.split()).split()
+    lines = []
+    line = ""
+    truncated = False
+
+    for word in words:
+        parts = []
+        part = ""
+        for character in word:
+            if part and font.measure(part + character) > width:
+                parts.append(part)
+                part = character
+            else:
+                part += character
+        if part:
+            parts.append(part)
+
+        for part in parts:
+            candidate = f"{line} {part}".strip()
+            if font.measure(candidate) <= width:
+                line = candidate
+            else:
+                if line:
+                    lines.append(line)
+                line = part
+                if len(lines) >= max_lines:
+                    truncated = True
+                    break
+        if truncated:
+            break
+
+    if line and len(lines) < max_lines:
+        lines.append(line)
+    elif line:
+        truncated = True
+
+    if truncated and lines:
+        last_line = lines[-1]
+        ellipsis = "..."
+        while last_line and font.measure(last_line + ellipsis) > width:
+            last_line = last_line[:-1]
+        lines[-1] = last_line + ellipsis
+    return "\n".join(lines)
+
+
+def enable_dark_title_bar(window):
+    if sys.platform != "win32":
+        return
+
+    from ctypes import wintypes
+
+    get_parent = ctypes.windll.user32.GetParent
+    get_parent.argtypes = (wintypes.HWND,)
+    get_parent.restype = wintypes.HWND
+    hwnd = get_parent(window.winfo_id())
+    dark_mode = wintypes.BOOL(True)
+    set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+    set_attribute.argtypes = (
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    set_attribute.restype = ctypes.c_long
+
+    for attribute in (20, 19):
+        result = set_attribute(
+            hwnd,
+            attribute,
+            ctypes.byref(dark_mode),
+            ctypes.sizeof(dark_mode),
+        )
+        if result == 0:
+            return
+
+    warnings.warn("Windows could not enable the dark title bar.", RuntimeWarning)
+
+
+def remove_title_bar_icon(window):
+    if sys.platform != "win32":
+        return
+
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    get_ancestor = user32.GetAncestor
+    get_ancestor.argtypes = (wintypes.HWND, wintypes.UINT)
+    get_ancestor.restype = wintypes.HWND
+    hwnd = get_ancestor(window.winfo_id(), 2)  # GA_ROOT
+
+    get_window_long = user32.GetWindowLongW
+    get_window_long.argtypes = (wintypes.HWND, ctypes.c_int)
+    get_window_long.restype = wintypes.DWORD
+    set_window_long = user32.SetWindowLongW
+    set_window_long.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.DWORD)
+    set_window_long.restype = wintypes.DWORD
+
+    extended_style = get_window_long(hwnd, -20)  # GWL_EXSTYLE
+    set_window_long(hwnd, -20, extended_style | 0x0001)  # WS_EX_DLGMODALFRAME
+
+    send_message = user32.SendMessageW
+    send_message.argtypes = (
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
+    send_message.restype = wintypes.LPARAM
+    send_message(hwnd, 0x0080, 0, 0)  # WM_SETICON, ICON_SMALL, no icon
+    send_message(hwnd, 0x0080, 1, 0)  # WM_SETICON, ICON_BIG, no icon
+
+    set_class_long = (
+        user32.SetClassLongPtrW
+        if ctypes.sizeof(ctypes.c_void_p) == 8
+        else user32.SetClassLongW
+    )
+    set_class_long.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
+    set_class_long.restype = ctypes.c_void_p
+    set_class_long(hwnd, -14, None)  # GCLP_HICON
+    set_class_long(hwnd, -34, None)  # GCLP_HICONSM
+
+    set_window_pos = user32.SetWindowPos
+    set_window_pos.argtypes = (
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    )
+    set_window_pos.restype = wintypes.BOOL
+    if not set_window_pos(hwnd, None, 0, 0, 0, 0, 0x0027):
+        raise ctypes.WinError()
+
+
+def main():
+    window = tk.Tk()
+    window.title("ClipStack")
+    window.geometry("650x230")
+    window.minsize(650, 230)
+    window.maxsize(650, 230)
+    window.configure(bg=BACKGROUND)
+    container = tk.Canvas(
+        window,
+        bg=BACKGROUND,
+        highlightthickness=0,
+        bd=0,
+    )
+    container.pack(fill="both", expand=True, padx=20, pady=20)
+    container.bind("<Configure>", lambda event: draw_container(container, event))
+
+    panel_content = tk.Frame(container, bg=PANEL)
+    panel_window = container.create_window(12, 12, anchor="nw", window=panel_content)
+    container.bind(
+        "<Configure>",
+        lambda event: (
+            draw_container(container, event),
+            container.itemconfigure(
+                panel_window,
+                width=max(1, event.width - 24),
+                height=max(1, event.height - 24),
+            ),
+        ),
+    )
+
+    card_font = tkfont.Font(family="Segoe UI", size=-11)
+    timestamp_font = tkfont.Font(family="Segoe UI", size=-8)
+    history_path = Path(__file__).resolve().with_name("clipboard_history.json")
+    history = load_history(history_path, window)
+    last_clipboard_sequence = None
+    clipboard_contains_image = False
+    hovered_index = None
+    card_lifts = {}
+    animation_pending = False
+    carousel = tk.Canvas(
+        panel_content,
+        bg=PANEL,
+        highlightthickness=0,
+        bd=0,
+    )
+    panel_content.grid_columnconfigure(0, weight=1)
+    panel_content.grid_rowconfigure(0, weight=1)
+    carousel.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 8))
+    scrollbar_height = 8
+    carousel_scrollbar = tk.Canvas(
+        panel_content,
+        bg=PANEL,
+        highlightthickness=0,
+        bd=0,
+        height=scrollbar_height,
+        cursor="",
+    )
+    carousel_scrollbar.grid(
+        row=1,
+        column=0,
+        sticky="ew",
+        padx=8,
+        pady=(4, 8),
+    )
+    carousel_scrollbar.grid_remove()
+
+    scrollbar_thumb = {
+        "start": 0.0,
+        "end": 1.0,
+        "drag_offset": 0.0,
+        "pixel_start": 0.0,
+        "pixel_width": 0.0,
+    }
+
+    def draw_carousel_scrollbar(first, last):
+        scrollbar_thumb["start"] = first
+        scrollbar_thumb["end"] = last
+        carousel_scrollbar.delete("thumb")
+        width = carousel_scrollbar.winfo_width()
+        if width <= 1 or last - first >= 1:
+            return
+        thumb_width = max(24, width * (last - first))
+        thumb_width = min(width, thumb_width)
+        travel = width - thumb_width
+        max_start = max(0.0, 1.0 - (last - first))
+        thumb_start = (first / max_start * travel) if max_start else 0.0
+        thumb_end = thumb_start + thumb_width
+        scrollbar_thumb["pixel_start"] = thumb_start
+        scrollbar_thumb["pixel_width"] = thumb_width
+        draw_rounded_rectangle(
+            carousel_scrollbar,
+            thumb_start,
+            2,
+            thumb_end - thumb_start,
+            4,
+            2,
+            "#555555",
+            tags="thumb",
+        )
+
+    def update_carousel_scrollbar(first, last):
+        if len(history) > 4:
+            if not carousel_scrollbar.winfo_manager():
+                carousel_scrollbar.grid()
+            draw_carousel_scrollbar(float(first), float(last))
+        else:
+            carousel_scrollbar.grid_remove()
+
+    def scroll_to_pointer(event):
+        width = carousel_scrollbar.winfo_width()
+        thumb_width = scrollbar_thumb["pixel_width"]
+        travel = width - thumb_width
+        if travel <= 0:
+            return
+        thumb_start = scrollbar_thumb["pixel_start"]
+        if thumb_start <= event.x <= thumb_start + thumb_width:
+            scrollbar_thumb["drag_offset"] = event.x - thumb_start
+        else:
+            scrollbar_thumb["drag_offset"] = thumb_width / 2
+        fraction = (
+            (event.x - scrollbar_thumb["drag_offset"])
+            / travel
+            * max(0.0, 1.0 - (scrollbar_thumb["end"] - scrollbar_thumb["start"]))
+        )
+        carousel.xview_moveto(max(0.0, min(1.0, fraction)))
+
+    def drag_scrollbar_thumb(event):
+        width = carousel_scrollbar.winfo_width()
+        thumb_width = scrollbar_thumb["pixel_width"]
+        travel = width - thumb_width
+        if travel <= 0:
+            return
+        fraction = (
+            (event.x - scrollbar_thumb["drag_offset"])
+            / travel
+            * max(0.0, 1.0 - (scrollbar_thumb["end"] - scrollbar_thumb["start"]))
+        )
+        carousel.xview_moveto(max(0.0, min(1.0, fraction)))
+
+    carousel_scrollbar.bind("<Button-1>", scroll_to_pointer)
+    carousel_scrollbar.bind("<B1-Motion>", drag_scrollbar_thumb)
+    carousel_scrollbar.bind(
+        "<Enter>",
+        lambda _event: carousel_scrollbar.itemconfigure("thumb", fill="#707070"),
+    )
+    carousel_scrollbar.bind(
+        "<Leave>",
+        lambda _event: carousel_scrollbar.itemconfigure("thumb", fill="#555555"),
+    )
+    carousel_scrollbar.bind(
+        "<Configure>",
+        lambda _event: draw_carousel_scrollbar(
+            scrollbar_thumb["start"], scrollbar_thumb["end"]
+        ),
+    )
+    carousel.configure(xscrollcommand=update_carousel_scrollbar)
+
+    def render_carousel(_event=None):
+        carousel.delete("all")
+        viewport_width = carousel.winfo_width()
+        if not history:
+            carousel.create_text(
+                max(1, viewport_width) // 2,
+                CARD_SIZE // 2,
+                text="Copy text to start building your clipboard history.",
+                fill="#a0a0a0",
+                font=card_font,
+                anchor="center",
+            )
+            carousel.configure(scrollregion=(0, 0, max(1, viewport_width), CARD_SIZE))
+            return
+
+        card_top = max(
+            HOVER_LIFT,
+            (carousel.winfo_height() - CARD_SIZE) // 2,
+        )
+        for index, (
+            item_type,
+            content,
+            copied_at,
+            thumbnail,
+            _image_format,
+        ) in enumerate(history):
+            x = 8 + index * (CARD_SIZE + CARD_GAP)
+            lift = card_lifts.get(index, 0)
+            y = card_top - lift
+            draw_rounded_rectangle(
+                carousel, x, y, CARD_SIZE, CARD_SIZE, 12, CARD
+            )
+            carousel.create_text(
+                x + CARD_SIZE // 2,
+                y + 14,
+                text=copied_at.strftime("%Y-%m-%d %H:%M:%S"),
+                fill="#a0a0a0",
+                font=timestamp_font,
+                anchor="center",
+            )
+            if item_type == "image":
+                carousel.create_image(
+                    x + CARD_SIZE // 2,
+                    y + 66,
+                    image=thumbnail,
+                    anchor="center",
+                )
+            else:
+                display_text = fit_clipboard_text(
+                    content,
+                    card_font,
+                    CARD_SIZE - 24,
+                    MAX_TEXT_LINES,
+                )
+                carousel.create_text(
+                    x + CARD_SIZE // 2,
+                    y + 56,
+                    text=display_text,
+                    fill="#eeeeee",
+                    font=card_font,
+                    width=CARD_SIZE - 24,
+                    anchor="center",
+                    justify="left",
+                )
+
+        content_width = 16 + len(history) * (CARD_SIZE + CARD_GAP) - CARD_GAP
+        carousel.configure(
+            scrollregion=(0, 0, max(viewport_width, content_width), CARD_SIZE)
+        )
+
+    def animate_hover():
+        nonlocal animation_pending
+        animation_pending = False
+        still_animating = False
+        for index in range(len(history)):
+            lift = card_lifts.get(index, 0)
+            target = HOVER_LIFT if index == hovered_index else 0
+            if lift < target:
+                card_lifts[index] = lift + 1
+                still_animating = True
+            elif lift > target:
+                card_lifts[index] = lift - 1
+                still_animating = True
+        for index in tuple(card_lifts):
+            if index >= len(history):
+                del card_lifts[index]
+        render_carousel()
+        if still_animating:
+            animation_pending = True
+            window.after(16, animate_hover)
+
+    def schedule_hover_animation():
+        nonlocal animation_pending
+        if not animation_pending:
+            animation_pending = True
+            window.after(16, animate_hover)
+
+    def update_hover(event):
+        nonlocal hovered_index
+        x = carousel.canvasx(event.x)
+        y = carousel.canvasy(event.y)
+        relative_x = x - 8
+        index = int(relative_x // (CARD_SIZE + CARD_GAP))
+        card_top = max(
+            HOVER_LIFT,
+            (carousel.winfo_height() - CARD_SIZE) // 2,
+        )
+        within_card = (
+            0 <= index < len(history)
+            and relative_x % (CARD_SIZE + CARD_GAP) < CARD_SIZE
+            and card_top - HOVER_LIFT <= y <= card_top + CARD_SIZE
+        )
+        new_index = index if within_card else None
+        if new_index != hovered_index:
+            hovered_index = new_index
+            schedule_hover_animation()
+
+    def clear_hover(_event=None):
+        nonlocal hovered_index
+        if hovered_index is not None:
+            hovered_index = None
+            schedule_hover_animation()
+
+    carousel.bind("<Configure>", render_carousel)
+    carousel.bind("<Motion>", update_hover)
+    carousel.bind("<Leave>", clear_hover)
+
+    def record_history_item(entry):
+        history.append(entry)
+        history.sort(key=lambda item: item[2], reverse=True)
+        del history[MAX_HISTORY:]
+        save_history(history_path, history)
+        render_carousel()
+        carousel.xview_moveto(0)
+
+    def capture_clipboard():
+        nonlocal last_clipboard_sequence, clipboard_contains_image
+
+        if sys.platform == "win32":
+            get_clipboard_sequence = ctypes.windll.user32.GetClipboardSequenceNumber
+            get_clipboard_sequence.argtypes = ()
+            get_clipboard_sequence.restype = ctypes.c_uint
+            sequence = get_clipboard_sequence()
+            if sequence != last_clipboard_sequence:
+                clipboard_opened, image_candidates = read_windows_clipboard_image(window)
+                if clipboard_opened:
+                    last_clipboard_sequence = sequence
+                    clipboard_contains_image = bool(image_candidates)
+                    thumbnail = None
+                    image_bytes = None
+                    selected_image_format = None
+                    image_error = None
+                    for image_format, candidate_data in image_candidates:
+                        try:
+                            thumbnail = open_clipboard_image(
+                                image_format,
+                                candidate_data,
+                                window,
+                            )
+                        except (
+                            OSError,
+                            ValueError,
+                            tk.TclError,
+                            Image.DecompressionBombError,
+                        ) as error:
+                            image_error = error
+                        else:
+                            image_bytes = candidate_data
+                            selected_image_format = image_format
+                            break
+
+                    if image_candidates and thumbnail is None:
+                        warnings.warn(
+                            f"Could not decode clipboard image: {image_error}",
+                            RuntimeWarning,
+                        )
+                    elif thumbnail is not None:
+                        if (
+                            not history
+                            or history[0][0] != "image"
+                            or history[0][1] != image_bytes
+                            or history[0][4] != selected_image_format
+                        ):
+                            record_history_item(
+                                (
+                                    "image",
+                                    image_bytes,
+                                    datetime.now(),
+                                    thumbnail,
+                                    selected_image_format,
+                                )
+                            )
+
+        if not clipboard_contains_image:
+            try:
+                text = window.clipboard_get()
+            except tk.TclError:
+                text = ""
+
+            if text and (
+                not history
+                or history[0][0] != "text"
+                or text != history[0][1]
+            ):
+                record_history_item(("text", text, datetime.now(), None, None))
+        window.after(500, capture_clipboard)
+
+    window.update_idletasks()
+    enable_dark_title_bar(window)
+    window.after_idle(remove_title_bar_icon, window)
+    window.after_idle(render_carousel)
+    window.after(0, capture_clipboard)
+    window.mainloop()
+
+
+if __name__ == "__main__":
+    main()

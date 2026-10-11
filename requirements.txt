@@ -1,0 +1,4 @@
+# External Python packages
+Pillow>=10.0.0
+
+# Tkinter and all other imports used by the app are included with Python.
