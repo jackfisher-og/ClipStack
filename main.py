@@ -3,6 +3,8 @@ import ctypes
 from datetime import datetime
 from io import BytesIO
 import json
+import math
+import os
 from pathlib import Path
 import struct
 import sys
@@ -10,9 +12,17 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 import warnings
-import zlib
 import pystray
-from PIL import Image, ImageDraw, ImageTk
+import zlib
+from PIL import (
+    Image,
+    ImageDraw,
+    ImageEnhance,
+    ImageFilter,
+    ImageFont,
+    ImageGrab,
+    ImageTk,
+)
 
 
 BACKGROUND = "#1e1e1e"
@@ -23,6 +33,99 @@ CARD_GAP = 12
 HOVER_LIFT = 6
 MAX_HISTORY = 50
 MAX_TEXT_LINES = 4
+APP_FONT_FAMILY = "Google Sans"
+
+
+THEMES = {
+    "dark": {
+        "background": "#1e1e1e",
+        "panel": "#2b2b2b",
+        "card": "#383838",
+        "text": "#eeeeee",
+        "muted": "#a0a0a0",
+        "icon": "#b8b8b8",
+        "scrollbar": "#555555",
+        "scrollbar_hover": "#707070",
+    },
+    "light": {
+        "background": "#f2f2f2",
+        "panel": "#ffffff",
+        "card": "#e5e5e5",
+        "text": "#202020",
+        "muted": "#686868",
+        "icon": "#555555",
+        "scrollbar": "#b8b8b8",
+        "scrollbar_hover": "#888888",
+    },
+}
+
+
+def theme_settings_path():
+    if sys.platform == "win32":
+        app_data = Path(
+            os.environ.get(
+                "LOCALAPPDATA",
+                Path.home() / "AppData" / "Local",
+            )
+        )
+        return app_data / "ClipStack" / "settings.json"
+    return Path.home() / ".config" / "ClipStack" / "settings.json"
+
+
+def load_theme():
+    settings_path = theme_settings_path()
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "dark"
+    except (OSError, json.JSONDecodeError) as error:
+        warnings.warn(f"Could not read theme settings: {error}", RuntimeWarning)
+        return "dark"
+
+    theme = settings.get("theme") if isinstance(settings, dict) else None
+    if not isinstance(theme, str) or theme not in THEMES:
+        warnings.warn("Theme settings are invalid; using dark mode.", RuntimeWarning)
+        return "dark"
+    return theme
+
+
+def save_theme(theme):
+    settings_path = theme_settings_path()
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps({"theme": theme}, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as error:
+        warnings.warn(f"Could not save theme settings: {error}", RuntimeWarning)
+
+
+def register_app_font(font_path):
+    if sys.platform != "win32":
+        return False
+
+    from ctypes import wintypes
+
+    add_font_resource = ctypes.windll.gdi32.AddFontResourceExW
+    add_font_resource.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPVOID)
+    add_font_resource.restype = wintypes.INT
+    if not add_font_resource(str(font_path), 0x10, None):
+        raise ctypes.WinError()
+    return True
+
+
+def unregister_app_font(font_path):
+    if sys.platform != "win32":
+        return
+
+    from ctypes import wintypes
+
+    remove_font_resource = ctypes.windll.gdi32.RemoveFontResourceExW
+    remove_font_resource.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPVOID)
+    remove_font_resource.restype = wintypes.BOOL
+    if not remove_font_resource(str(font_path), 0x10, None):
+        warnings.warn("Could not unregister the Google Sans app font.", RuntimeWarning)
 
 
 def load_history(history_path, master):
@@ -677,27 +780,57 @@ def enable_dark_title_bar(window):
     warnings.warn("Windows could not enable the dark title bar.", RuntimeWarning)
 
 
-def remove_title_bar_icon(window):
+def set_windows_app_icon(window, icon_path):
     if sys.platform != "win32":
-        return
+        return ()
 
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
+    load_image = user32.LoadImageW
+    load_image.argtypes = (
+        wintypes.HINSTANCE,
+        wintypes.LPCWSTR,
+        wintypes.UINT,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    )
+    load_image.restype = wintypes.HANDLE
+    load_from_file = 0x0010
+    image_icon = 1
+    icon_handles = []
+    for width_metric, height_metric in ((11, 12), (49, 50)):
+        width = user32.GetSystemMetrics(width_metric)
+        height = user32.GetSystemMetrics(height_metric)
+        icon_handle = load_image(
+            None,
+            str(icon_path),
+            image_icon,
+            width,
+            height,
+            load_from_file,
+        )
+        if not icon_handle:
+            raise ctypes.WinError()
+        icon_handles.append(icon_handle)
+
     get_ancestor = user32.GetAncestor
     get_ancestor.argtypes = (wintypes.HWND, wintypes.UINT)
     get_ancestor.restype = wintypes.HWND
-    hwnd = get_ancestor(window.winfo_id(), 2)  # GA_ROOT
+    hwnd = get_ancestor(window.winfo_id(), 2)
+    if not hwnd:
+        raise ctypes.WinError()
 
-    get_window_long = user32.GetWindowLongW
-    get_window_long.argtypes = (wintypes.HWND, ctypes.c_int)
-    get_window_long.restype = wintypes.DWORD
-    set_window_long = user32.SetWindowLongW
-    set_window_long.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.DWORD)
-    set_window_long.restype = wintypes.DWORD
-
-    extended_style = get_window_long(hwnd, -20)  # GWL_EXSTYLE
-    set_window_long(hwnd, -20, extended_style | 0x0001)  # WS_EX_DLGMODALFRAME
+    set_class_icon = (
+        user32.SetClassLongPtrW
+        if ctypes.sizeof(ctypes.c_void_p) == 8
+        else user32.SetClassLongW
+    )
+    set_class_icon.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
+    set_class_icon.restype = ctypes.c_void_p
+    set_class_icon(hwnd, -14, icon_handles[0])
+    set_class_icon(hwnd, -34, icon_handles[1])
 
     send_message = user32.SendMessageW
     send_message.argtypes = (
@@ -707,49 +840,118 @@ def remove_title_bar_icon(window):
         wintypes.LPARAM,
     )
     send_message.restype = wintypes.LPARAM
-    send_message(hwnd, 0x0080, 0, 0)  # WM_SETICON, ICON_SMALL, no icon
-    send_message(hwnd, 0x0080, 1, 0)  # WM_SETICON, ICON_BIG, no icon
+    send_message(hwnd, 0x0080, 1, icon_handles[0])
+    send_message(hwnd, 0x0080, 0, icon_handles[1])
+    return tuple(icon_handles)
 
-    set_class_long = (
-        user32.SetClassLongPtrW
-        if ctypes.sizeof(ctypes.c_void_p) == 8
-        else user32.SetClassLongW
-    )
-    set_class_long.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
-    set_class_long.restype = ctypes.c_void_p
-    set_class_long(hwnd, -14, None)  # GCLP_HICON
-    set_class_long(hwnd, -34, None)  # GCLP_HICONSM
 
-    set_window_pos = user32.SetWindowPos
-    set_window_pos.argtypes = (
-        wintypes.HWND,
-        wintypes.HWND,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        wintypes.UINT,
+def create_footer_icon(kind, background, master, color):
+    scale = 3
+    size = 20 * scale
+    center = size // 2
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    if kind == "sun":
+        draw.ellipse(
+            (center - 5 * scale, center - 5 * scale,
+             center + 5 * scale, center + 5 * scale),
+            outline=color,
+            width=2 * scale,
+        )
+        for angle in range(0, 360, 45):
+            radians = math.radians(angle)
+            inner_radius = 7 * scale
+            outer_radius = 9 * scale
+            draw.line(
+                (
+                    center + math.cos(radians) * inner_radius,
+                    center + math.sin(radians) * inner_radius,
+                    center + math.cos(radians) * outer_radius,
+                    center + math.sin(radians) * outer_radius,
+                ),
+                fill=color,
+                width=2 * scale,
+            )
+    elif kind == "refresh":
+        radius = 7 * scale
+        for start_angle, end_angle in ((35, 155), (215, 335)):
+            draw.arc(
+                (
+                    center - radius,
+                    center - radius,
+                    center + radius,
+                    center + radius,
+                ),
+                start=start_angle,
+                end=end_angle,
+                fill=color,
+                width=2 * scale,
+            )
+            angle = math.radians(end_angle)
+            tip_x = center + math.cos(angle) * radius
+            tip_y = center + math.sin(angle) * radius
+            tangent_x = -math.sin(angle)
+            tangent_y = math.cos(angle)
+            normal_x = math.cos(angle)
+            normal_y = math.sin(angle)
+            draw.polygon(
+                (
+                    (tip_x, tip_y),
+                    (
+                        tip_x - tangent_x * 4 * scale - normal_x * 2 * scale,
+                        tip_y - tangent_y * 4 * scale - normal_y * 2 * scale,
+                    ),
+                    (
+                        tip_x - tangent_x * 4 * scale + normal_x * 2 * scale,
+                        tip_y - tangent_y * 4 * scale + normal_y * 2 * scale,
+                    ),
+                ),
+                fill=color,
+            )
+    else:
+        raise ValueError(f"Unsupported footer icon: {kind!r}.")
+
+    return ImageTk.PhotoImage(
+        image.resize((16, 16), Image.Resampling.LANCZOS),
+        master=master,
     )
-    set_window_pos.restype = wintypes.BOOL
-    if not set_window_pos(hwnd, None, 0, 0, 0, 0, 0x0027):
-        raise ctypes.WinError()
 
 
 def main():
+    global BACKGROUND, PANEL, CARD
+
+    app_root = Path(__file__).resolve().parent
+    font_path = app_root / "Fonts" / "GoogleSans-VariableFont_GRAD,opsz,wght.ttf"
+    app_font_registered = register_app_font(font_path)
+    theme_name = load_theme()
+    save_theme(theme_name)
+    palette = THEMES[theme_name]
+    BACKGROUND = palette["background"]
+    PANEL = palette["panel"]
+    CARD = palette["card"]
+    text_color = palette["text"]
+    muted_color = palette["muted"]
+    icon_color = palette["icon"]
+
     window = tk.Tk()
     window.title("ClipStack")
-    window.geometry("650x230")
-    window.minsize(650, 230)
-    window.maxsize(650, 230)
+    icon_path = app_root / "Icons" / "icon.ico"
+    window.iconbitmap(default=str(icon_path))
+    window.geometry("650x260")
+    window.minsize(650, 260)
+    window.maxsize(650, 260)
     window.configure(bg=BACKGROUND)
     window.withdraw()
+    window.grid_columnconfigure(0, weight=1)
+    window.grid_rowconfigure(0, weight=1)
     container = tk.Canvas(
         window,
         bg=BACKGROUND,
         highlightthickness=0,
         bd=0,
     )
-    container.pack(fill="both", expand=True, padx=20, pady=20)
+    container.grid(row=0, column=0, sticky="nsew", padx=20, pady=(20, 6))
     container.bind("<Configure>", lambda event: draw_container(container, event))
 
     panel_content = tk.Frame(container, bg=PANEL)
@@ -766,11 +968,129 @@ def main():
         ),
     )
 
-    card_font = tkfont.Font(family="Segoe UI", size=-11)
-    timestamp_font = tkfont.Font(family="Segoe UI", size=-8)
+    footer = tk.Canvas(
+        window,
+        bg=BACKGROUND,
+        height=34,
+        highlightthickness=0,
+        bd=0,
+    )
+    footer.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10))
+
+    def draw_footer_background(event=None):
+        footer.delete("footer_background")
+        draw_rounded_rectangle(
+            footer,
+            0,
+            0,
+            event.width if event else footer.winfo_width(),
+            event.height if event else footer.winfo_height(),
+            12,
+            PANEL,
+            tags="footer_background",
+        )
+        footer.tag_lower("footer_background")
+
+    footer.bind("<Configure>", draw_footer_background)
+    tooltip_window = None
+    tooltip_font = tkfont.Font(family=APP_FONT_FAMILY, size=9)
+    dialog_font = tkfont.Font(family=APP_FONT_FAMILY, size=10)
+    dialog_button_font = tkfont.Font(family=APP_FONT_FAMILY, size=9)
+
+    def show_footer_tooltip(event, text):
+        nonlocal tooltip_window
+        if tooltip_window is None:
+            transparent_color = "#010203" if sys.platform == "win32" else BACKGROUND
+            tooltip_window = tk.Toplevel(window)
+            tooltip_window.overrideredirect(True)
+            tooltip_window.attributes("-topmost", True)
+            tooltip_window.configure(bg=transparent_color)
+            if sys.platform == "win32":
+                tooltip_window.attributes("-transparentcolor", transparent_color)
+            tooltip_canvas = tk.Canvas(
+                tooltip_window,
+                bg=transparent_color,
+                highlightthickness=0,
+                bd=0,
+            )
+            tooltip_canvas.pack()
+            tooltip_window.tooltip_canvas = tooltip_canvas
+
+        tooltip_canvas = tooltip_window.tooltip_canvas
+        width = tooltip_font.measure(text) + 24
+        height = 28
+        tooltip_canvas.configure(width=width, height=height)
+        tooltip_canvas.delete("all")
+        draw_rounded_rectangle(
+            tooltip_canvas,
+            0,
+            0,
+            width,
+            height,
+            height // 2,
+            CARD,
+        )
+        tooltip_canvas.create_text(
+            width // 2,
+            height // 2,
+            text=text,
+            fill=text_color,
+            font=tooltip_font,
+        )
+        x = event.widget.winfo_rootx() + (event.widget.winfo_width() - width) // 2
+        y = event.widget.winfo_rooty() - height - 6
+        tooltip_window.geometry(f"{width}x{height}+{x}+{y}")
+        tooltip_window.deiconify()
+
+    def hide_footer_tooltip(_event=None):
+        if tooltip_window is not None:
+            tooltip_window.withdraw()
+
+    footer_icon_images = [
+        create_footer_icon("refresh", PANEL, window, icon_color),
+        create_footer_icon("sun", PANEL, window, icon_color),
+    ]
+    footer_buttons = []
+    for index, (icon_image, tooltip_text) in enumerate(
+        zip(footer_icon_images, ("Restart Clipboard", "Change Theme"))
+    ):
+        button = tk.Canvas(
+            footer,
+            bg=PANEL,
+            highlightthickness=0,
+            bd=0,
+            width=28,
+            height=28,
+            cursor="hand2",
+        )
+        draw_rounded_rectangle(button, 0, 0, 28, 28, 10, PANEL, tags="button_bg")
+        button.icon_item = button.create_image(14, 14, image=icon_image)
+        button.image = icon_image
+        footer_buttons.append(button)
+        button.bind(
+            "<Leave>",
+            lambda event, target=button: (
+                target.itemconfigure("button_bg", fill=PANEL, outline=PANEL),
+                hide_footer_tooltip(event),
+            ),
+        )
+        button.bind(
+            "<Enter>",
+            lambda event, text=tooltip_text, target=button: (
+                target.itemconfigure("button_bg", fill=CARD, outline=CARD),
+                show_footer_tooltip(event, text),
+            ),
+        )
+        button.place(x=4 + index * 34, y=3, width=28, height=28)
+
+    card_font = tkfont.Font(family=APP_FONT_FAMILY, size=-11)
+    timestamp_font = tkfont.Font(family=APP_FONT_FAMILY, size=-8)
     history_path = Path(__file__).resolve().with_name("clipboard_history.json")
     history = load_history(history_path, window)
+    clear_history_dialog = None
+    clear_history_dialog_image = None
     last_clipboard_sequence = None
+    last_clipboard_text = None
     clipboard_contains_image = False
     hovered_index = None
     copied_index = None
@@ -834,7 +1154,7 @@ def main():
             thumb_end - thumb_start,
             4,
             2,
-            "#555555",
+            palette["scrollbar"],
             tags="thumb",
         )
 
@@ -881,11 +1201,15 @@ def main():
     carousel_scrollbar.bind("<B1-Motion>", drag_scrollbar_thumb)
     carousel_scrollbar.bind(
         "<Enter>",
-        lambda _event: carousel_scrollbar.itemconfigure("thumb", fill="#707070"),
+        lambda _event: carousel_scrollbar.itemconfigure(
+            "thumb", fill=palette["scrollbar_hover"]
+        ),
     )
     carousel_scrollbar.bind(
         "<Leave>",
-        lambda _event: carousel_scrollbar.itemconfigure("thumb", fill="#555555"),
+        lambda _event: carousel_scrollbar.itemconfigure(
+            "thumb", fill=palette["scrollbar"]
+        ),
     )
     carousel_scrollbar.bind(
         "<Configure>",
@@ -902,8 +1226,8 @@ def main():
             carousel.create_text(
                 max(1, viewport_width) // 2,
                 CARD_SIZE // 2,
-                text="Copy text to start building your clipboard history.",
-                fill="#a0a0a0",
+                text="Copy text or images to start building your clipboard history.",
+                fill=muted_color,
                 font=card_font,
                 anchor="center",
             )
@@ -931,7 +1255,7 @@ def main():
                 x + CARD_SIZE // 2,
                 y + 14,
                 text=copied_at.strftime("%Y-%m-%d %H:%M:%S"),
-                fill="#a0a0a0",
+                fill=muted_color,
                 font=timestamp_font,
                 anchor="center",
             )
@@ -953,7 +1277,7 @@ def main():
                     x + CARD_SIZE // 2,
                     y + 56,
                     text=display_text,
-                    fill="#eeeeee",
+                    fill=text_color,
                     font=card_font,
                     width=CARD_SIZE - 24,
                     anchor="center",
@@ -1098,6 +1422,54 @@ def main():
             carousel.configure(cursor="")
             schedule_hover_animation()
 
+    def toggle_theme():
+        nonlocal theme_name, palette, text_color, muted_color, icon_color
+        global BACKGROUND, PANEL, CARD
+
+        theme_name = "light" if theme_name == "dark" else "dark"
+        palette = THEMES[theme_name]
+        BACKGROUND = palette["background"]
+        PANEL = palette["panel"]
+        CARD = palette["card"]
+        text_color = palette["text"]
+        muted_color = palette["muted"]
+        icon_color = palette["icon"]
+        save_theme(theme_name)
+
+        window.configure(bg=BACKGROUND)
+        container.configure(bg=BACKGROUND)
+        panel_content.configure(bg=PANEL)
+        footer.configure(bg=BACKGROUND)
+        draw_container(container)
+        draw_footer_background()
+        carousel.configure(bg=PANEL)
+        carousel_scrollbar.configure(bg=PANEL)
+        carousel_scrollbar.itemconfigure("thumb", fill=palette["scrollbar"])
+        draw_carousel_scrollbar(
+            scrollbar_thumb["start"],
+            scrollbar_thumb["end"],
+        )
+        for button, kind in zip(footer_buttons, ("refresh", "sun")):
+            button.configure(bg=PANEL)
+            button.delete("all")
+            draw_rounded_rectangle(
+                button,
+                0,
+                0,
+                28,
+                28,
+                10,
+                PANEL,
+                tags="button_bg",
+            )
+            icon_image = create_footer_icon(kind, PANEL, window, icon_color)
+            button.icon_item = button.create_image(14, 14, image=icon_image)
+            button.image = icon_image
+        hide_footer_tooltip()
+        render_carousel()
+
+    footer_buttons[1].bind("<Button-1>", lambda _event: toggle_theme())
+
     carousel.bind("<Configure>", render_carousel)
     carousel.bind("<Motion>", update_hover)
     carousel.bind("<Button-1>", copy_carousel_item)
@@ -1128,10 +1500,188 @@ def main():
         render_carousel()
         carousel.xview_moveto(0)
 
-    def capture_clipboard():
-        nonlocal last_clipboard_sequence, clipboard_contains_image
+    def close_clear_history_dialog():
+        nonlocal clear_history_dialog, clear_history_dialog_image
+        if clear_history_dialog is not None:
+            clear_history_dialog.grab_release()
+            clear_history_dialog.destroy()
+            clear_history_dialog = None
+            clear_history_dialog_image = None
+            window.lift()
+            window.focus_force()
 
-        clipboard_changed = sys.platform != "win32"
+    def confirm_clear_history():
+        nonlocal copied_index, copied_feedback_timer
+        history.clear()
+        card_lifts.clear()
+        copied_index = None
+        if copied_feedback_timer is not None:
+            window.after_cancel(copied_feedback_timer)
+            copied_feedback_timer = None
+        save_history(history_path, history)
+        render_carousel()
+        carousel.xview_moveto(0)
+        close_clear_history_dialog()
+
+    def show_clear_history_dialog(_event=None):
+        nonlocal clear_history_dialog, clear_history_dialog_image
+        if clear_history_dialog is not None:
+            return
+
+        hide_footer_tooltip()
+        window.update_idletasks()
+        window_x = window.winfo_rootx()
+        window_y = window.winfo_rooty()
+        window_width = window.winfo_width()
+        window_height = window.winfo_height()
+        try:
+            background_image = ImageGrab.grab(
+                bbox=(
+                    window_x,
+                    window_y,
+                    window_x + window_width,
+                    window_y + window_height,
+                )
+            )
+        except OSError as error:
+            warnings.warn(
+                f"Could not capture the app window for the confirmation dialog: {error}",
+                RuntimeWarning,
+            )
+            background_image = Image.new(
+                "RGB",
+                (window_width, window_height),
+                BACKGROUND,
+            )
+        if background_image.size != (window_width, window_height):
+            background_image = background_image.resize(
+                (window_width, window_height),
+                Image.Resampling.LANCZOS,
+            )
+        clear_history_dialog_image = ImageTk.PhotoImage(
+            ImageEnhance.Brightness(
+                background_image.filter(ImageFilter.GaussianBlur(radius=8))
+            ).enhance(0.72),
+            master=window,
+        )
+
+        clear_history_dialog = tk.Canvas(
+            window,
+            bg=BACKGROUND,
+            bd=0,
+            highlightthickness=0,
+            cursor="",
+        )
+        clear_history_dialog.place(x=0, y=0, relwidth=1, relheight=1)
+        clear_history_dialog.create_image(
+            0,
+            0,
+            image=clear_history_dialog_image,
+            anchor="nw",
+        )
+        dialog_width = 420
+        dialog_height = 166
+        dialog_x = (window_width - dialog_width) // 2
+        dialog_y = (window_height - dialog_height) // 2
+        draw_rounded_rectangle(
+            clear_history_dialog,
+            dialog_x,
+            dialog_y,
+            dialog_width,
+            dialog_height,
+            12,
+            PANEL,
+        )
+        clear_history_dialog.create_text(
+            window_width // 2,
+            dialog_y + 50,
+            text="This action will clear your clipboard entirely.\nDo you wish to continue?",
+            width=dialog_width - 48,
+            justify="center",
+            fill=text_color,
+            font=dialog_font,
+        )
+        for x, label, tag, fill, hover_fill, foreground in (
+            (
+                window_width // 2 - 112,
+                "Cancel",
+                "cancel_button",
+                CARD,
+                palette["scrollbar"],
+                text_color,
+            ),
+            (
+                window_width // 2 + 12,
+                "Confirm",
+                "confirm_button",
+                "#b84444",
+                "#a33b3b",
+                "#ffffff",
+            ),
+        ):
+            button_y = dialog_y + 104
+            draw_rounded_rectangle(
+                clear_history_dialog,
+                x,
+                button_y,
+                100,
+                36,
+                10,
+                fill,
+                tags=(tag, f"{tag}_background"),
+            )
+            clear_history_dialog.create_text(
+                x + 50,
+                button_y + 18,
+                text=label,
+                anchor="center",
+                justify="center",
+                fill=foreground,
+                font=dialog_button_font,
+                tags=tag,
+            )
+
+            def on_button_enter(_event, button_tag=tag, color=hover_fill):
+                clear_history_dialog.itemconfigure(
+                    f"{button_tag}_background",
+                    fill=color,
+                    outline=color,
+                )
+                clear_history_dialog.configure(cursor="hand2")
+
+            def on_button_leave(_event, button_tag=tag, color=fill):
+                clear_history_dialog.itemconfigure(
+                    f"{button_tag}_background",
+                    fill=color,
+                    outline=color,
+                )
+                clear_history_dialog.configure(cursor="")
+
+            clear_history_dialog.tag_bind(tag, "<Enter>", on_button_enter)
+            clear_history_dialog.tag_bind(tag, "<Leave>", on_button_leave)
+            clear_history_dialog.tag_bind(
+                tag,
+                "<Button-1>",
+                (
+                    (lambda _event: close_clear_history_dialog())
+                    if tag == "cancel_button"
+                    else (lambda _event: confirm_clear_history())
+                ),
+            )
+        clear_history_dialog.bind(
+            "<Escape>",
+            lambda _event: close_clear_history_dialog(),
+        )
+        clear_history_dialog.grab_set()
+        clear_history_dialog.focus_force()
+
+    footer_buttons[0].bind("<Button-1>", show_clear_history_dialog)
+
+    def capture_clipboard():
+        nonlocal last_clipboard_sequence, last_clipboard_text
+        nonlocal clipboard_contains_image
+
+        clipboard_changed = False
         if sys.platform == "win32":
             get_clipboard_sequence = ctypes.windll.user32.GetClipboardSequenceNumber
             get_clipboard_sequence.argtypes = ()
@@ -1189,11 +1739,10 @@ def main():
             except tk.TclError:
                 text = ""
 
-            if text and (
-                clipboard_changed
-                if sys.platform == "win32"
-                else not history or history[0][0] != "text" or text != history[0][1]
-            ):
+            if sys.platform != "win32":
+                clipboard_changed = text != last_clipboard_text
+                last_clipboard_text = text
+            if text and clipboard_changed:
                 record_history_item(("text", text, datetime.now(), None, None))
         window.after(500, capture_clipboard)
 
@@ -1215,6 +1764,8 @@ def main():
             )
         tray_icon.stop()
         window.destroy()
+        if app_font_registered:
+            unregister_app_font(font_path)
 
     def schedule_show_window(_icon=None, _item=None):
         window.after(0, show_window)
@@ -1225,7 +1776,12 @@ def main():
     tray_image = Image.new("RGBA", (64, 64), "#1e1e1e")
     tray_draw = ImageDraw.Draw(tray_image)
     tray_draw.rounded_rectangle((6, 6, 58, 58), radius=12, fill="#4caf50")
-    tray_draw.text((17, 11), "C", fill="#ffffff")
+    tray_draw.text(
+        (17, 11),
+        "C",
+        fill="#ffffff",
+        font=ImageFont.truetype(str(font_path), 36),
+    )
     tray_icon = pystray.Icon(
         "ClipStack",
         tray_image,
@@ -1302,11 +1858,21 @@ def main():
 
     window.update_idletasks()
     enable_dark_title_bar(window)
-    window.after_idle(remove_title_bar_icon, window)
+    _window_icon_handles = set_windows_app_icon(window, icon_path)
     window.after_idle(render_carousel)
     window.after_idle(
         lambda: threading.Thread(target=listen_for_hotkey, daemon=True).start()
     )
+    if sys.platform == "win32":
+        get_clipboard_sequence = ctypes.windll.user32.GetClipboardSequenceNumber
+        get_clipboard_sequence.argtypes = ()
+        get_clipboard_sequence.restype = ctypes.c_uint
+        last_clipboard_sequence = get_clipboard_sequence()
+    else:
+        try:
+            last_clipboard_text = window.clipboard_get()
+        except tk.TclError:
+            last_clipboard_text = ""
     window.after(0, capture_clipboard)
     show_window()
     window.mainloop()
