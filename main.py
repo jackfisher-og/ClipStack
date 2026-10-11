@@ -6,11 +6,13 @@ import json
 from pathlib import Path
 import struct
 import sys
+import threading
 import tkinter as tk
 import tkinter.font as tkfont
 import warnings
 import zlib
-from PIL import Image, ImageTk
+import pystray
+from PIL import Image, ImageDraw, ImageTk
 
 
 BACKGROUND = "#1e1e1e"
@@ -381,7 +383,7 @@ def read_windows_clipboard_image(window):
         user32.CloseClipboard()
 
 
-def open_clipboard_image(image_format, data, master):
+def clipboard_image_data(image_format, data):
     if image_format == "dib":
         if len(data) < 40:
             raise ValueError("Clipboard DIB header is incomplete.")
@@ -404,12 +406,114 @@ def open_clipboard_image(image_format, data, master):
             0,
             pixel_offset + 14,
         )
-        data = bmp_header + data
+        return bmp_header + data
+    return data
+
+
+def same_image_content(first_format, first_data, second_format, second_data):
+    try:
+        with Image.open(
+            BytesIO(clipboard_image_data(first_format, first_data))
+        ) as first_image, Image.open(
+            BytesIO(clipboard_image_data(second_format, second_data))
+        ) as second_image:
+            first_image.load()
+            second_image.load()
+            if first_image.size != second_image.size:
+                return False
+            return (
+                first_image.convert("RGBA").tobytes()
+                == second_image.convert("RGBA").tobytes()
+            )
+    except (OSError, ValueError, Image.DecompressionBombError) as error:
+        warnings.warn(f"Could not compare clipboard images: {error}", RuntimeWarning)
+        return False
+
+
+def open_clipboard_image(image_format, data, master):
+    data = clipboard_image_data(image_format, data)
 
     with Image.open(BytesIO(data)) as image:
         image.load()
         image.thumbnail((92, 66), Image.Resampling.LANCZOS)
         return ImageTk.PhotoImage(image.convert("RGBA"), master=master)
+
+
+def write_windows_clipboard_image(window, image_format, data):
+    if sys.platform != "win32":
+        raise OSError("Copying images to the clipboard is only supported on Windows.")
+
+    data = clipboard_image_data(image_format, data)
+    with Image.open(BytesIO(data)) as image:
+        image.load()
+        png_stream = BytesIO()
+        image.convert("RGBA").save(png_stream, format="PNG")
+        bmp_stream = BytesIO()
+        image.convert("RGB").save(bmp_stream, format="BMP")
+    png_data = png_stream.getvalue()
+    dib_data = bmp_stream.getvalue()[14:]
+
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    register_format = user32.RegisterClipboardFormatW
+    register_format.argtypes = (wintypes.LPCWSTR,)
+    register_format.restype = wintypes.UINT
+    png_format = register_format("PNG")
+    if not png_format:
+        raise ctypes.WinError()
+
+    open_clipboard = user32.OpenClipboard
+    open_clipboard.argtypes = (wintypes.HWND,)
+    open_clipboard.restype = wintypes.BOOL
+    if not open_clipboard(window.winfo_id()):
+        raise ctypes.WinError()
+
+    allocated_handles = []
+    try:
+        empty_clipboard = user32.EmptyClipboard
+        empty_clipboard.argtypes = ()
+        empty_clipboard.restype = wintypes.BOOL
+        if not empty_clipboard():
+            raise ctypes.WinError()
+
+        global_alloc = kernel32.GlobalAlloc
+        global_alloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+        global_alloc.restype = wintypes.HGLOBAL
+        global_lock = kernel32.GlobalLock
+        global_lock.argtypes = (wintypes.HGLOBAL,)
+        global_lock.restype = ctypes.c_void_p
+        global_unlock = kernel32.GlobalUnlock
+        global_unlock.argtypes = (wintypes.HGLOBAL,)
+        global_unlock.restype = wintypes.BOOL
+        global_free = kernel32.GlobalFree
+        global_free.argtypes = (wintypes.HGLOBAL,)
+        global_free.restype = wintypes.HGLOBAL
+        set_clipboard_data = user32.SetClipboardData
+        set_clipboard_data.argtypes = (wintypes.UINT, wintypes.HANDLE)
+        set_clipboard_data.restype = wintypes.HANDLE
+
+        for clipboard_format, clipboard_data in (
+            (png_format, png_data),
+            (8, dib_data),
+        ):
+            handle = global_alloc(0x0002, len(clipboard_data))
+            if not handle:
+                raise ctypes.WinError()
+            allocated_handles.append(handle)
+            pointer = global_lock(handle)
+            if not pointer:
+                raise ctypes.WinError()
+            ctypes.memmove(pointer, clipboard_data, len(clipboard_data))
+            global_unlock(handle)
+            if not set_clipboard_data(clipboard_format, handle):
+                raise ctypes.WinError()
+            allocated_handles.remove(handle)
+    finally:
+        for handle in allocated_handles:
+            global_free(handle)
+        user32.CloseClipboard()
 
 
 def draw_container(canvas, _event=None):
@@ -638,6 +742,7 @@ def main():
     window.minsize(650, 230)
     window.maxsize(650, 230)
     window.configure(bg=BACKGROUND)
+    window.withdraw()
     container = tk.Canvas(
         window,
         bg=BACKGROUND,
@@ -668,6 +773,8 @@ def main():
     last_clipboard_sequence = None
     clipboard_contains_image = False
     hovered_index = None
+    copied_index = None
+    copied_feedback_timer = None
     card_lifts = {}
     animation_pending = False
     carousel = tk.Canvas(
@@ -852,6 +959,25 @@ def main():
                     anchor="center",
                     justify="left",
                 )
+            if index == copied_index:
+                carousel.create_line(
+                    x + CARD_SIZE - 22,
+                    y + CARD_SIZE - 15,
+                    x + CARD_SIZE - 18,
+                    y + CARD_SIZE - 11,
+                    fill="#4caf50",
+                    width=2,
+                    capstyle="round",
+                )
+                carousel.create_line(
+                    x + CARD_SIZE - 18,
+                    y + CARD_SIZE - 11,
+                    x + CARD_SIZE - 10,
+                    y + CARD_SIZE - 21,
+                    fill="#4caf50",
+                    width=2,
+                    capstyle="round",
+                )
 
         content_width = 16 + len(history) * (CARD_SIZE + CARD_GAP) - CARD_GAP
         carousel.configure(
@@ -903,21 +1029,100 @@ def main():
         new_index = index if within_card else None
         if new_index != hovered_index:
             hovered_index = new_index
+            carousel.configure(cursor="hand2" if new_index is not None else "")
             schedule_hover_animation()
+
+    def copy_carousel_item(event):
+        nonlocal clipboard_contains_image, last_clipboard_sequence
+        nonlocal copied_index, copied_feedback_timer
+        x = carousel.canvasx(event.x)
+        y = carousel.canvasy(event.y)
+        relative_x = x - 8
+        index = int(relative_x // (CARD_SIZE + CARD_GAP))
+        if not (
+            0 <= index < len(history)
+            and relative_x % (CARD_SIZE + CARD_GAP) < CARD_SIZE
+        ):
+            return
+
+        card_top = max(
+            HOVER_LIFT,
+            (carousel.winfo_height() - CARD_SIZE) // 2,
+        )
+        card_top -= card_lifts.get(index, 0)
+        if not card_top <= y <= card_top + CARD_SIZE:
+            return
+
+        item_type, content, _copied_at, _thumbnail, image_format = history[index]
+        try:
+            if item_type == "text":
+                window.clipboard_clear()
+                window.clipboard_append(content)
+                clipboard_contains_image = False
+            else:
+                write_windows_clipboard_image(window, image_format, content)
+                clipboard_contains_image = True
+            copied_index = 0
+            record_history_item(
+                (item_type, content, datetime.now(), _thumbnail, image_format)
+            )
+            if copied_feedback_timer is not None:
+                window.after_cancel(copied_feedback_timer)
+            copied_feedback_timer = window.after(3000, hide_copy_feedback)
+            if sys.platform == "win32":
+                get_clipboard_sequence = ctypes.windll.user32.GetClipboardSequenceNumber
+                get_clipboard_sequence.argtypes = ()
+                get_clipboard_sequence.restype = ctypes.c_uint
+                last_clipboard_sequence = get_clipboard_sequence()
+        except (
+            OSError,
+            ValueError,
+            tk.TclError,
+            Image.DecompressionBombError,
+        ) as error:
+            warnings.warn(
+                f"Could not copy clipboard history item: {error}",
+                RuntimeWarning,
+            )
+
+    def hide_copy_feedback():
+        nonlocal copied_index, copied_feedback_timer
+        copied_index = None
+        copied_feedback_timer = None
+        render_carousel()
 
     def clear_hover(_event=None):
         nonlocal hovered_index
         if hovered_index is not None:
             hovered_index = None
+            carousel.configure(cursor="")
             schedule_hover_animation()
 
     carousel.bind("<Configure>", render_carousel)
     carousel.bind("<Motion>", update_hover)
+    carousel.bind("<Button-1>", copy_carousel_item)
     carousel.bind("<Leave>", clear_hover)
 
     def record_history_item(entry):
-        history.append(entry)
-        history.sort(key=lambda item: item[2], reverse=True)
+        item_type, content, _copied_at, _thumbnail, image_format = entry
+        for index in range(len(history) - 1, -1, -1):
+            existing_type, existing_content, _, _, existing_format = history[index]
+            matches = existing_type == item_type
+            if matches and item_type == "text":
+                matches = existing_content == content
+            elif matches:
+                matches = (
+                    existing_format == image_format and existing_content == content
+                ) or same_image_content(
+                    existing_format,
+                    existing_content,
+                    image_format,
+                    content,
+                )
+            if matches:
+                del history[index]
+
+        history.insert(0, entry)
         del history[MAX_HISTORY:]
         save_history(history_path, history)
         render_carousel()
@@ -926,12 +1131,15 @@ def main():
     def capture_clipboard():
         nonlocal last_clipboard_sequence, clipboard_contains_image
 
+        clipboard_changed = sys.platform != "win32"
         if sys.platform == "win32":
             get_clipboard_sequence = ctypes.windll.user32.GetClipboardSequenceNumber
             get_clipboard_sequence.argtypes = ()
             get_clipboard_sequence.restype = ctypes.c_uint
             sequence = get_clipboard_sequence()
-            if sequence != last_clipboard_sequence:
+            clipboard_changed = sequence != last_clipboard_sequence
+            if clipboard_changed:
+                clipboard_contains_image = False
                 clipboard_opened, image_candidates = read_windows_clipboard_image(window)
                 if clipboard_opened:
                     last_clipboard_sequence = sequence
@@ -965,21 +1173,15 @@ def main():
                             RuntimeWarning,
                         )
                     elif thumbnail is not None:
-                        if (
-                            not history
-                            or history[0][0] != "image"
-                            or history[0][1] != image_bytes
-                            or history[0][4] != selected_image_format
-                        ):
-                            record_history_item(
-                                (
-                                    "image",
-                                    image_bytes,
-                                    datetime.now(),
-                                    thumbnail,
-                                    selected_image_format,
-                                )
+                        record_history_item(
+                            (
+                                "image",
+                                image_bytes,
+                                datetime.now(),
+                                thumbnail,
+                                selected_image_format,
                             )
+                        )
 
         if not clipboard_contains_image:
             try:
@@ -988,18 +1190,125 @@ def main():
                 text = ""
 
             if text and (
-                not history
-                or history[0][0] != "text"
-                or text != history[0][1]
+                clipboard_changed
+                if sys.platform == "win32"
+                else not history or history[0][0] != "text" or text != history[0][1]
             ):
                 record_history_item(("text", text, datetime.now(), None, None))
         window.after(500, capture_clipboard)
+
+    def show_window():
+        window.deiconify()
+        window.lift()
+        window.focus_force()
+
+    def hide_to_tray(_event=None):
+        window.withdraw()
+
+    def exit_application():
+        if hotkey_thread_id[0] is not None:
+            ctypes.windll.user32.PostThreadMessageW(
+                hotkey_thread_id[0],
+                0x0012,
+                0,
+                0,
+            )
+        tray_icon.stop()
+        window.destroy()
+
+    def schedule_show_window(_icon=None, _item=None):
+        window.after(0, show_window)
+
+    def schedule_exit_application(_icon=None, _item=None):
+        window.after(0, exit_application)
+
+    tray_image = Image.new("RGBA", (64, 64), "#1e1e1e")
+    tray_draw = ImageDraw.Draw(tray_image)
+    tray_draw.rounded_rectangle((6, 6, 58, 58), radius=12, fill="#4caf50")
+    tray_draw.text((17, 11), "C", fill="#ffffff")
+    tray_icon = pystray.Icon(
+        "ClipStack",
+        tray_image,
+        "ClipStack",
+        menu=pystray.Menu(
+            pystray.MenuItem("Open ClipStack", schedule_show_window, default=True),
+            pystray.MenuItem("Exit", schedule_exit_application),
+        ),
+    )
+    tray_icon.run_detached()
+    window.protocol("WM_DELETE_WINDOW", hide_to_tray)
+
+    hotkey_thread_id = [None]
+
+    def listen_for_hotkey():
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        get_current_thread_id = kernel32.GetCurrentThreadId
+        get_current_thread_id.argtypes = ()
+        get_current_thread_id.restype = wintypes.DWORD
+        hotkey_thread_id[0] = get_current_thread_id()
+
+        message = wintypes.MSG()
+        get_message = user32.GetMessageW
+        get_message.argtypes = (
+            ctypes.POINTER(wintypes.MSG),
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.UINT,
+        )
+        get_message.restype = ctypes.c_int
+        peek_message = user32.PeekMessageW
+        peek_message.argtypes = (
+            ctypes.POINTER(wintypes.MSG),
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.UINT,
+            wintypes.UINT,
+        )
+        peek_message.restype = wintypes.BOOL
+        peek_message(ctypes.byref(message), None, 0, 0, 0)
+
+        register_hotkey = user32.RegisterHotKey
+        register_hotkey.argtypes = (
+            wintypes.HWND,
+            ctypes.c_int,
+            wintypes.UINT,
+            wintypes.UINT,
+        )
+        register_hotkey.restype = wintypes.BOOL
+        hotkey_id = 1
+        if not register_hotkey(None, hotkey_id, 0x0002 | 0x0001, ord("V")):
+            warnings.warn(
+                "Could not register the Ctrl+Alt+V global hotkey.",
+                RuntimeWarning,
+            )
+            return
+
+        try:
+            while True:
+                result = get_message(ctypes.byref(message), None, 0, 0)
+                if result == -1:
+                    raise ctypes.WinError()
+                if result == 0:
+                    break
+                if message.message == 0x0312 and message.wParam == hotkey_id:
+                    window.after(0, show_window)
+        except tk.TclError:
+            pass
+        finally:
+            user32.UnregisterHotKey(None, hotkey_id)
 
     window.update_idletasks()
     enable_dark_title_bar(window)
     window.after_idle(remove_title_bar_icon, window)
     window.after_idle(render_carousel)
+    window.after_idle(
+        lambda: threading.Thread(target=listen_for_hotkey, daemon=True).start()
+    )
     window.after(0, capture_clipboard)
+    show_window()
     window.mainloop()
 
 

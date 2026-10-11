@@ -1,4 +1,5 @@
 # External Python packages
 Pillow>=10.0.0
+pystray>=0.19.5
 
-# Tkinter and all other imports used by the app are included with Python.
+# Tkinter and other standard-library imports are included with Python.
