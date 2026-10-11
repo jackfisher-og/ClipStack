@@ -847,6 +847,63 @@ def set_windows_app_icon(window, icon_path):
     return tuple(icon_handles)
 
 
+def disable_window_maximize(window):
+    if sys.platform != "win32":
+        return
+
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    get_ancestor = user32.GetAncestor
+    get_ancestor.argtypes = (wintypes.HWND, wintypes.UINT)
+    get_ancestor.restype = wintypes.HWND
+    hwnd = get_ancestor(window.winfo_id(), 2)
+    if not hwnd:
+        raise ctypes.WinError()
+
+    get_window_long = user32.GetWindowLongW
+    get_window_long.argtypes = (wintypes.HWND, ctypes.c_int)
+    get_window_long.restype = wintypes.LONG
+    set_window_long = (
+        user32.SetWindowLongPtrW
+        if ctypes.sizeof(ctypes.c_void_p) == 8
+        else user32.SetWindowLongW
+    )
+    set_window_long.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.LONG)
+    set_window_long.restype = wintypes.LONG
+
+    style = get_window_long(hwnd, -16)
+    style &= ~0x00010000
+    if not set_window_long(hwnd, -16, style):
+        raise ctypes.WinError()
+
+    get_system_menu = user32.GetSystemMenu
+    get_system_menu.argtypes = (wintypes.HWND, wintypes.BOOL)
+    get_system_menu.restype = wintypes.HMENU
+    system_menu = get_system_menu(hwnd, False)
+    delete_menu = user32.DeleteMenu
+    delete_menu.argtypes = (wintypes.HMENU, wintypes.UINT, wintypes.UINT)
+    delete_menu.restype = wintypes.BOOL
+    if system_menu and not delete_menu(system_menu, 0xF030, 0):
+        raise ctypes.WinError()
+
+    set_window_pos = user32.SetWindowPos
+    set_window_pos.argtypes = (
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    )
+    set_window_pos.restype = wintypes.BOOL
+    if not set_window_pos(hwnd, None, 0, 0, 0, 0, 0x0027):
+        raise ctypes.WinError()
+    if not user32.DrawMenuBar(hwnd):
+        raise ctypes.WinError()
+
+
 def create_footer_icon(kind, background, master, color):
     scale = 3
     size = 20 * scale
@@ -1855,6 +1912,7 @@ def main():
 
     window.update_idletasks()
     enable_dark_title_bar(window)
+    disable_window_maximize(window)
     _window_icon_handles = set_windows_app_icon(window, icon_path)
     window.after_idle(render_carousel)
     window.after_idle(
